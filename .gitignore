@@ -1,0 +1,13 @@
+# Inno Setup build output
+dist/*.exe
+dist/Output/
+
+# Windows cruft
+Thumbs.db
+desktop.ini
+*.lnk
+
+# Editor
+.vscode/
+.idea/
+*.swp
