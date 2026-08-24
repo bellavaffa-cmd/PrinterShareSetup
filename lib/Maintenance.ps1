@@ -81,10 +81,14 @@ function Install-PSSWatchdog {
         $taskName = $script:PSSHostTaskName
         $action   = New-ScheduledTaskAction -Execute $psExe `
                         -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`" -Role Host"
+        # No -RepetitionDuration: an absent duration is what Task Scheduler
+        # reads as "Indefinitely". Passing [TimeSpan]::MaxValue serialises to a
+        # duration the task XML rejects outright ("contains a value which is
+        # incorrectly formatted or out of range"), and so does [TimeSpan]::Zero.
         $triggers = @(
             (New-ScheduledTaskTrigger -AtStartup),
             (New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(1) `
-                -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration ([TimeSpan]::MaxValue))
+                -RepetitionInterval (New-TimeSpan -Minutes 15))
         )
         $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     } else {
@@ -94,7 +98,7 @@ function Install-PSSWatchdog {
         $triggers = @(
             (New-ScheduledTaskTrigger -AtLogOn),
             (New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(2) `
-                -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration ([TimeSpan]::MaxValue))
+                -RepetitionInterval (New-TimeSpan -Minutes 30))
         )
         # Runs in each interactive user's own profile, which is where printer
         # connections actually live.
@@ -363,10 +367,23 @@ function Invoke-PSSUndo {
             'Powercfg' {
                 try {
                     if ($d.Kind -eq 'timeout') {
-                        $mins = [int]([math]::Round([double]$d.OldSeconds / 60))
-                        Invoke-PSSNative -FilePath "$env:SystemRoot\System32\powercfg.exe" `
-                            -Arguments @('/change', $d.Setting, "$mins") `
-                            -Describe "Restored $($d.Setting) to $mins minute(s)" | Out-Null
+                        # Prefer the exact seconds path. /change rounds to whole
+                        # minutes, which turns a 30-second timeout into 0 = never.
+                        $sub = "$($d.SubGroup)"
+                        $gid = "$($d.SettingGuid)"
+                        if ($sub -and $gid) {
+                            Invoke-PSSNative -FilePath "$env:SystemRoot\System32\powercfg.exe" `
+                                -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', $sub, $gid, "$($d.OldSeconds)") | Out-Null
+                            Invoke-PSSNative -FilePath "$env:SystemRoot\System32\powercfg.exe" `
+                                -Arguments @('/setactive', 'SCHEME_CURRENT') | Out-Null
+                            Write-PSSLog "Restored $($d.Setting) to $($d.OldSeconds) second(s)" 'OK'
+                        } else {
+                            # Rollback point written before the subgroup was recorded.
+                            $mins = [int]([math]::Round([double]$d.OldSeconds / 60))
+                            Invoke-PSSNative -FilePath "$env:SystemRoot\System32\powercfg.exe" `
+                                -Arguments @('/change', $d.Setting, "$mins") `
+                                -Describe "Restored $($d.Setting) to $mins minute(s)" | Out-Null
+                        }
                     } else {
                         Invoke-PSSNative -FilePath "$env:SystemRoot\System32\powercfg.exe" `
                             -Arguments @('/setacvalueindex', 'SCHEME_CURRENT', $d.SubGroup, $d.Setting, "$($d.OldSeconds)") | Out-Null
@@ -435,12 +452,61 @@ function Invoke-PSSUndo {
                     Write-PSSLog "Removed scheduled task $($d.Name)" 'OK'
                 } catch { }
             }
+            'NetProfile' {
+                try {
+                    $old = "$($d.OldCategory)"
+                    if ($old) {
+                        Set-NetConnectionProfile -InterfaceIndex $d.InterfaceIndex `
+                            -NetworkCategory $old -ErrorAction Stop
+                        Write-PSSLog "Network '$($d.Name)' set back to $old" 'OK'
+                    }
+                } catch {
+                    Write-PSSLog "Could not restore the network profile for '$($d.Name)': $($_.Exception.Message)" 'WARN'
+                }
+            }
+            'Firewall' {
+                $off = 0
+                foreach ($rn in @($d.RuleNames)) {
+                    if (-not "$rn") { continue }
+                    try {
+                        Set-NetFirewallRule -Name "$rn" -Enabled False -ErrorAction Stop
+                        $off++
+                    } catch { }
+                }
+                if ($off -gt 0) {
+                    Write-PSSLog "Disabled $off '$($d.Label)' firewall rule(s) that were turned on" 'OK'
+                }
+            }
         }
     }
 
     try {
         Restart-Service -Name Spooler -Force -ErrorAction SilentlyContinue
     } catch { }
+
+    # Consume the rollback point. Without this Get-PSSLatestJournal keeps
+    # handing back the same file, so a second Undo replays the same restore
+    # instead of stepping further back, and every earlier rollback point is
+    # unreachable from the UI for good.
+    try {
+        $used = $JournalPath + '.undone'
+        if (Test-Path -LiteralPath $used) { Remove-Item -LiteralPath $used -Force -ErrorAction SilentlyContinue }
+        Rename-Item -LiteralPath $JournalPath -NewName ([IO.Path]::GetFileName($used)) -Force -ErrorAction Stop
+    } catch {
+        Write-PSSLog "Could not mark the rollback point as used: $($_.Exception.Message)" 'WARN'
+    }
+
+    # Running the setup twice makes two rollback points, and one Undo only
+    # walks back one of them. Say so, rather than letting a screen full of
+    # "Restored ..." lines imply the PC is back to how it started.
+    $remaining = 0
+    try {
+        $remaining = @(Get-ChildItem -LiteralPath (Split-Path -Parent $JournalPath) `
+                        -Filter '*.json' -ErrorAction SilentlyContinue).Count
+    } catch { }
+    if ($remaining -gt 0) {
+        Write-PSSLog "$remaining earlier rollback point(s) remain. This undid only the most recent run - use Undo again to step further back." 'WARN'
+    }
 
     Write-PSSLog '=== Undo complete ===' 'STEP'
     return $true

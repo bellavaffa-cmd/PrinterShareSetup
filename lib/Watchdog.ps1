@@ -155,5 +155,11 @@ if ($Role -eq 'Host') {
 
 if ($repairs -gt 0) {
     Write-WD "Finished - $repairs repair(s) applied" 'OK'
+} else {
+    # Always leave a heartbeat. Without one the log stays empty while
+    # everything is healthy, and an empty log is indistinguishable from a
+    # helper that never ran or died on startup - which is the one thing
+    # someone opening this file is trying to find out.
+    Write-WD 'Checked - nothing needed fixing' 'OK'
 }
 exit 0

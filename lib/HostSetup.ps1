@@ -110,7 +110,11 @@ function Enable-PSSPrinterShare {
     if ($GrantEveryonePrint) {
         # Default printer security descriptor plus an explicit Print grant to
         # Everyone (WD). Admins and Power Users keep full management rights.
-        $sddl = 'O:BAG:DUD:(A;;SWRC;;;WD)(A;OIIO;GA;;;CO)(A;;LCSWSDRCWDWO;;;BA)(A;OIIO;GA;;;BA)(A;;SWRC;;;AU)'
+        # The group is BA, not DU: "Domain Users" does not exist on a machine
+        # that is not domain-joined, and an SDDL naming it cannot be translated,
+        # so Set-Printer rejected the whole descriptor on every workgroup PC -
+        # which is exactly where this tool is used.
+        $sddl = 'O:BAG:BAD:(A;;SWRC;;;WD)(A;OIIO;GA;;;CO)(A;;LCSWSDRCWDWO;;;BA)(A;OIIO;GA;;;BA)(A;;SWRC;;;AU)'
         try {
             Set-Printer -Name $PrinterName -PermissionSDDL $sddl -ErrorAction Stop
             Write-PSSLog "'$PrinterName' print permission granted to all users" 'OK'
@@ -135,6 +139,15 @@ function Set-PSSNetworkProfilePrivate {
             return $true
         }
         foreach ($pr in $profiles) {
+            # Journal before changing. Flipping a network to Private is one of
+            # the more consequential things this tool does - it is what makes
+            # the PC discoverable - so it has to be reversible like everything
+            # else.
+            Add-PSSJournalEntry -Kind 'NetProfile' -Data @{
+                InterfaceIndex = $pr.InterfaceIndex
+                Name           = "$($pr.Name)"
+                OldCategory    = "$($pr.NetworkCategory)"
+            }
             Set-NetConnectionProfile -InterfaceIndex $pr.InterfaceIndex -NetworkCategory Private -ErrorAction Stop
             Write-PSSLog "Network '$($pr.Name)' switched from Public to Private" 'OK'
         }
@@ -172,6 +185,16 @@ function Enable-PSSSharingFirewall {
                 $wanted  = $rules | Where-Object { "$($_.Profile)" -ne 'Public' }
                 $skipped = @($rules).Count - @($wanted).Count
                 if ($wanted) {
+                    # Journal only the rules this actually turns on. Recording
+                    # the ones already enabled would make the undo switch off
+                    # sharing the user had configured themselves.
+                    $changed = @($wanted | Where-Object { "$($_.Enabled)" -ne 'True' } |
+                                 ForEach-Object { $_.Name })
+                    if ($changed.Count -gt 0) {
+                        Add-PSSJournalEntry -Kind 'Firewall' -Data @{
+                            Label = $g.Label; RuleNames = $changed
+                        }
+                    }
                     $wanted | Enable-NetFirewallRule -ErrorAction Stop
                     $enabled = @($wanted).Count
                     if ($skipped -gt 0) {
@@ -250,8 +273,13 @@ function Set-PSSAlwaysOnPower {
         # Record the old value first so "Undo the last run" can put it back.
         $old = Get-PSSPowerAcIndex -SubGroup $t.Sub -Setting $t.Set
         if ($null -ne $old) {
+            # Record the subgroup/setting as well as the /change flag. The undo
+            # restores through /setacvalueindex, which takes seconds; /change
+            # only takes whole minutes, so a 30-second timeout would round to 0
+            # and come back as "never" instead of its original value.
             Add-PSSJournalEntry -Kind 'Powercfg' -Data @{
                 Kind = 'timeout'; Setting = $t.Flag; OldSeconds = $old
+                SubGroup = $t.Sub; SettingGuid = $t.Set
             }
         }
         Invoke-PSSNative -FilePath "$env:SystemRoot\System32\powercfg.exe" `

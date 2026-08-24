@@ -73,11 +73,41 @@ panel renders; `Get-PSSLocalPrinters` correctly classified three real queues
 `ConvertTo-PSSShareName` all behave; the installer compiles, silently installs,
 and silently uninstalls with no leftovers.
 
-**Still unverified: the write paths.** `Invoke-PSSHostSetup`,
-`Invoke-PSSClientSetup`, `Install-PSSWatchdog` and `Invoke-PSSUndo` have never
-been run — they change live system state, so they need a deliberate run on a
-machine where that is acceptable. Apply, then confirm the rollback journal in
-`C:\ProgramData\PrinterShareSetup\rollback\` actually restores everything.
+### Host write paths — run for real 2026-08-24
+
+`Invoke-PSSHostSetup`, `Install-PSSWatchdog` and `Invoke-PSSUndo` have now been
+run against a live spooler, and the machine was returned to its exact starting
+state afterwards (18/18 settings verified). That run found four defects, all
+fixed: the watchdog trigger, the `DU` SDDL, undo not consuming its rollback
+point, and the silent watchdog log. The watchdog was also proved to work by
+un-sharing a printer and watching it re-share and log the repair.
+
+**Verified by execution:** sharing, firewall enable, service changes, power
+changes, spooler tuning, watchdog install + repair + heartbeat, undo of
+registry/service/powercfg/printer/task entries, and undo stepping back through
+successive rollback points.
+
+**Written but NOT yet executed** — the fixes for the gaps that same run exposed:
+
+- `NetProfile` journal + undo case (network profile was previously not
+  reversible at all)
+- `Firewall` journal + undo case (the rules it enabled were previously not
+  reversible at all)
+- the exact-seconds powercfg restore (`/change` takes whole minutes, so a
+  30-second disk timeout used to round to 0 and come back as "never")
+
+These parse clean and were derived from observed behaviour, but the apply→undo
+round trip that would prove them has not been run. Do that before trusting
+them: apply, confirm `Firewall`/`NetProfile` entries appear in the journal
+under `C:\ProgramData\PrinterShareSetup\rollback\`, undo, then check the
+firewall counts, network category and disk timeout are back.
+
+**`Invoke-PSSClientSetup` remains entirely unexercised.**
+
+Beware: an elevated child process died silently once mid-undo, writing only its
+first log line and no error. It was not reproducible. If undo stops early,
+check the app's own log in `C:\ProgramData\PrinterShareSetup\logs\` — the
+transcript loses buffered output when the process dies, the app log does not.
 
 To exercise read-only paths without the GUI, dot-source the four `lib` files
 and call the `Get-*`/`Test-*` functions directly. Note that **RichTextBox
@@ -125,8 +155,17 @@ WinForms panels use absolute coordinates. Usable content area is about
   matching bare `0x00000000` always succeeds. Anchor on
   `Current AC Power Setting Index:`.
 - `NetPopup` lives under `Control\Print\Providers`, not `Control\Print`.
-- `New-ScheduledTaskTrigger -RepetitionDuration` wants `[TimeSpan]::MaxValue`
-  for "indefinitely".
+- `New-ScheduledTaskTrigger`: **omit `-RepetitionDuration` entirely** for
+  "indefinitely". An earlier note here claimed `[TimeSpan]::MaxValue` was
+  wanted — that is exactly backwards, and it silently cost the host watchdog:
+  `Register-ScheduledTask` fails with "The task XML contains a value which is
+  incorrectly formatted or out of range." `[TimeSpan]::Zero` fails the same
+  way. Verified against the real Task Scheduler: `AtStartup` alone passes,
+  omitted duration passes, 3650 days passes, MaxValue and Zero both fail.
+- Printer `PermissionSDDL` must not name `DU` (Domain Users). On a workgroup
+  PC that SID cannot be translated and `Set-Printer` rejects the entire
+  descriptor, so "Let everyone print" degraded to a warning on every
+  non-domain machine. Use `G:BA`.
 - Printer connections and `HKCU` writes are **per-user**. If UAC is satisfied
   with a different admin account than the one signed in, they land in the wrong
   profile. The client watchdog runs as `BUILTIN\Users` at logon to compensate.
