@@ -145,8 +145,10 @@ WinForms panels use absolute coordinates. Usable content area is about
 
 ## Git
 
-`main` tracks `origin` at https://github.com/bellavaffa-cmd/printer-share-setup
-(public). Commit as `bellavaffa-cmd <bellavaffa-cmd@users.noreply.github.com>`
+`main` tracks `origin` at https://github.com/bellavaffa-cmd/PrinterShareSetup
+(public). The repo name deliberately matches the folder name — it was briefly
+`printer-share-setup` and that made it unfindable by searching for the folder.
+Commit as `bellavaffa-cmd <bellavaffa-cmd@users.noreply.github.com>`
 — the identity is set per-repo here, not globally.
 
 `dist/*.exe` is gitignored on purpose: the installer is a build artifact, so
